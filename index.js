@@ -2,9 +2,9 @@ require("dotenv").config();
 const { Telegraf, Markup } = require("telegraf");
 const express = require("express");
 const axios = require("axios");
-const fs = require("fs");
 const cron = require("node-cron");
 const Groq = require("groq-sdk");
+const { MongoClient } = require("mongodb");
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const app = express();
@@ -14,9 +14,22 @@ const ADMIN_ID = parseInt(process.env.ADMIN_ID);
 const THANK_DELAY_MS = parseInt(process.env.THANK_DELAY_MS) || 180000;
 const REMINDER_DAYS = parseInt(process.env.SUBSCRIPTION_REMINDER_DAYS) || 3;
 const RENDER_URL = process.env.RENDER_URL;
+const MONGO_URI = process.env.MONGO_URI;
 
-const LEADS_FILE = "leads.json";
-const SUBSCRIPTIONS_FILE = "subscriptions.json";
+// ====== MongoDB Setup ======
+let db;
+let leadsCol;
+let subscriptionsCol;
+
+async function connectDB() {
+  const client = new MongoClient(MONGO_URI);
+  await client.connect();
+  db = client.db("bot");
+  leadsCol = db.collection("leads");
+  subscriptionsCol = db.collection("subscriptions");
+
+  console.log("✅ Connected to MongoDB");
+}
 
 // ====== Groq AI Setup ======
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -73,7 +86,6 @@ async function askGroq(chatId, userMessage) {
     const reply = response.choices[0]?.message?.content || null;
 
     if (reply) {
-      // Keep last 10 exchanges to save memory
       history.push({ role: "user", content: userMessage });
       history.push({ role: "assistant", content: reply });
       if (history.length > 20) history.splice(0, 2);
@@ -85,24 +97,6 @@ async function askGroq(chatId, userMessage) {
     return null;
   }
 }
-
-// ====== File Helpers ======
-async function readJSON(file) {
-  try {
-    const data = await fs.promises.readFile(file, "utf8");
-    return JSON.parse(data);
-  } catch {
-    return [];
-  }
-}
-async function writeJSON(file, data) {
-  await fs.promises.writeFile(file, JSON.stringify(data, null, 2));
-}
-
-(async () => {
-  if (!fs.existsSync(LEADS_FILE)) await writeJSON(LEADS_FILE, []);
-  if (!fs.existsSync(SUBSCRIPTIONS_FILE)) await writeJSON(SUBSCRIPTIONS_FILE, []);
-})();
 
 // ====== Thank-You Timer ======
 const thanksTimers = new Map();
@@ -176,10 +170,22 @@ async function saveLead(ctx, service, totalPrice, subscriptionDays, details, con
   const { name, phone, location } = contactInfo;
   const chatId = ctx.chat.id;
   const paymentRef = "STG" + Date.now();
+  const createdAt = new Date();
 
-  const leads = await readJSON(LEADS_FILE);
-  leads.push({ chatId, name, phone, location, service, totalPrice, subscriptionDays, details, paymentRef, paid: false });
-  await writeJSON(LEADS_FILE, leads);
+  // Save lead to MongoDB
+  await leadsCol.insertOne({
+    chatId,
+    name,
+    phone,
+    location,
+    service,
+    totalPrice,
+    subscriptionDays,
+    details,
+    paymentRef,
+    paid: false,
+    createdAt,
+  });
 
   await bot.telegram.sendMessage(
     ADMIN_ID,
@@ -468,13 +474,11 @@ bot.on("text", async (ctx) => {
 
   scheduleThankYou(chatId);
 
-  // Cancel at any point
   if (lower === "/cancel" || lower === "cancel") {
     clearSession(chatId);
     return ctx.reply("❌ Cancelled. Returning to main menu.", MAIN_MENU);
   }
 
-  // Route active session
   const session = getSession(chatId);
   if (session) {
     try {
@@ -491,7 +495,6 @@ bot.on("text", async (ctx) => {
     }
   }
 
-  // Let AI handle informational/question messages first
   const isQuestion =
     lower.startsWith("what") || lower.startsWith("how") ||
     lower.startsWith("tell") || lower.startsWith("explain") ||
@@ -506,7 +509,6 @@ bot.on("text", async (ctx) => {
     if (aiReply) return ctx.reply(aiReply, { parse_mode: "Markdown" });
   }
 
-  // Start service flows
   if (lower.includes("cctv")) {
     setSession(chatId, { flow: "cctv", step: "cameras", data: {} });
     return ctx.reply("📹 *CCTV Installation*\nHow many cameras do you need?", { parse_mode: "Markdown" });
@@ -524,7 +526,6 @@ bot.on("text", async (ctx) => {
     return ctx.reply("🤖 *Automation Services*\nChoose a plan:\n*30-day / 60-day / 90-day*", { parse_mode: "Markdown" });
   }
 
-  // Static options
   if (lower.includes("see our work") || lower.includes("portfolio")) {
     return ctx.reply("💼 *Our Portfolio*\nCheck out our work at: https://stogic.com/portfolio\n\nFeel free to ask about any service!", { parse_mode: "Markdown" });
   }
@@ -541,7 +542,6 @@ bot.on("text", async (ctx) => {
     return sendMainMenu(ctx);
   }
 
-  // AI handles everything else
   await ctx.sendChatAction("typing");
   const aiReply = await askGroq(chatId, text);
   if (aiReply) return ctx.reply(aiReply, { parse_mode: "Markdown" });
@@ -555,30 +555,30 @@ bot.on("text", async (ctx) => {
 // ===== Subscription Reminder Cron =====
 cron.schedule("0 9 * * *", async () => {
   try {
-    const subs = await readJSON(SUBSCRIPTIONS_FILE);
     const now = Date.now();
-    let changed = false;
+    const subs = await subscriptionsCol.find({ expired: { $ne: true } }).toArray();
 
     for (const sub of subs) {
-      if (sub.expired) continue;
       const daysLeft = Math.ceil((sub.expiryDate - now) / (1000 * 60 * 60 * 24));
+
       if (daysLeft === REMINDER_DAYS) {
         await bot.telegram.sendMessage(sub.chatId,
           `⚠️ Reminder: Your *${sub.service}* subscription expires in ${REMINDER_DAYS} days. Contact us to renew!`,
           { parse_mode: "Markdown" }
         );
       }
+
       if (daysLeft <= 0) {
-        sub.expired = true;
-        sub.paid = false;
-        changed = true;
+        await subscriptionsCol.updateOne(
+          { _id: sub._id },
+          { $set: { expired: true, paid: false } }
+        );
         await bot.telegram.sendMessage(sub.chatId,
           `❌ Your *${sub.service}* subscription has expired. Contact us to renew!`,
           { parse_mode: "Markdown" }
         );
       }
     }
-    if (changed) await writeJSON(SUBSCRIPTIONS_FILE, subs);
   } catch (err) {
     console.error("Cron job error:", err);
   }
@@ -602,8 +602,29 @@ process.once("SIGTERM", () => bot.stop("SIGTERM"));
 
 // ===== Start =====
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Stogic Bot server running on port ${PORT}`));
 
-bot.launch()
-  .then(() => console.log("🤖 Telegram bot launched"))
-  .catch((err) => console.error("❌ Bot launch failed:", err.message));
+connectDB()
+  .then(() => {
+    app.listen(PORT, () => console.log(`🚀 Stogic Bot server running on port ${PORT}`));
+
+    const launchTimeout = setTimeout(() => {
+      console.error("❌ Bot launch timed out after 20 seconds. Check BOT_TOKEN or network.");
+      process.exit(1);
+    }, 20000);
+
+    bot.launch()
+      .then(() => {
+        clearTimeout(launchTimeout);
+        console.log("🤖 Telegram bot launched");
+      })
+      .catch((err) => {
+        clearTimeout(launchTimeout);
+        console.error("❌ Bot launch failed:", err.message);
+        console.error("Full error:", JSON.stringify(err, null, 2));
+        process.exit(1);
+      });
+  })
+  .catch((err) => {
+    console.error("❌ DB connection failed:", err.message);
+    process.exit(1);
+  });
