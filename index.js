@@ -22,7 +22,7 @@ const SUBSCRIPTIONS_FILE = "subscriptions.json";
 
 // ====== Gemini AI Setup ======
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const geminiModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.0-flash" }); // Fixed model name
 
 const STOGIC_SYSTEM_PROMPT = `You are Stogic AI, a friendly and professional customer support assistant for Stogic Digital Solutions, a tech company based in Accra, Ghana.
 
@@ -41,7 +41,7 @@ Services offered:
 Company info:
 - Location: Accra, Ghana
 - Email: info@stogic.com
-- Phone: +233 XX XXX XXXX
+- Phone: +233 59 382 7001
 - Website: https://stogic.com
 
 Important rules:
@@ -176,7 +176,6 @@ async function saveLead(ctx, service, totalPrice, subscriptionDays, details, con
   leads.push({ chatId, name, phone, location, service, totalPrice, subscriptionDays, details, paymentRef, paid: false });
   await writeJSON(LEADS_FILE, leads);
 
-  // Notify admin
   await bot.telegram.sendMessage(
     ADMIN_ID,
 `🚨 *New Lead Alert!*
@@ -192,13 +191,11 @@ async function saveLead(ctx, service, totalPrice, subscriptionDays, details, con
     { parse_mode: "Markdown" }
   );
 
-  // Show quote to customer
   await ctx.reply(
     `✅ Your quote for *${service}* is *GHS ${totalPrice}*.\nOptions selected: ${JSON.stringify(details)}`,
     { parse_mode: "Markdown" }
   );
 
-  // MoMo payment instructions
   await ctx.reply(
 `💳 *How to Pay*
 ━━━━━━━━━━━━━━━
@@ -466,13 +463,11 @@ bot.on("text", async (ctx) => {
 
   scheduleThankYou(chatId);
 
-  // Cancel at any point
   if (lower === "/cancel" || lower === "cancel") {
     clearSession(chatId);
     return ctx.reply("❌ Cancelled. Returning to main menu.", MAIN_MENU);
   }
 
-  // Route active session
   const session = getSession(chatId);
   if (session) {
     try {
@@ -489,7 +484,6 @@ bot.on("text", async (ctx) => {
     }
   }
 
-  // Start new flows
   if (lower.includes("cctv")) {
     setSession(chatId, { flow: "cctv", step: "cameras", data: {} });
     return ctx.reply("📹 *CCTV Installation*\nHow many cameras do you need?", { parse_mode: "Markdown" });
@@ -506,8 +500,6 @@ bot.on("text", async (ctx) => {
     setSession(chatId, { flow: "automation", step: "plan", data: {} });
     return ctx.reply("🤖 *Automation Services*\nChoose a plan:\n*30-day / 60-day / 90-day*", { parse_mode: "Markdown" });
   }
-
-  // Static options
   if (lower.includes("see our work") || lower.includes("portfolio")) {
     return ctx.reply("💼 *Our Portfolio*\nCheck out our work at: https://stogic.com/portfolio\n\nFeel free to ask about any service!", { parse_mode: "Markdown" });
   }
@@ -535,14 +527,11 @@ bot.on("text", async (ctx) => {
   });
 });
 
-// ===== Flutterwave Webhook (ready for when you activate it) =====
+// ===== Flutterwave Webhook (ready for later) =====
 app.post("/flutterwave-webhook", async (req, res) => {
   try {
     const hash = req.headers["verif-hash"];
-    if (!hash || hash !== FLW_WEBHOOK_SECRET) {
-      console.warn("Unauthorized webhook attempt");
-      return res.sendStatus(401);
-    }
+    if (!hash || hash !== FLW_WEBHOOK_SECRET) return res.sendStatus(401);
 
     const event = req.body;
     if (!event || !event.data) return res.sendStatus(400);
@@ -559,8 +548,7 @@ app.post("/flutterwave-webhook", async (req, res) => {
 
     const leads = await readJSON(LEADS_FILE);
     const lead = leads.find((l) => l.paymentRef === paymentRef);
-    if (!lead) return res.sendStatus(200);
-    if (lead.paid) return res.sendStatus(200);
+    if (!lead || lead.paid) return res.sendStatus(200);
 
     lead.paid = true;
     await writeJSON(LEADS_FILE, leads);
@@ -597,7 +585,6 @@ cron.schedule("0 9 * * *", async () => {
     for (const sub of subs) {
       if (sub.expired) continue;
       const daysLeft = Math.ceil((sub.expiryDate - now) / (1000 * 60 * 60 * 24));
-
       if (daysLeft === REMINDER_DAYS) {
         await bot.telegram.sendMessage(sub.chatId,
           `⚠️ Reminder: Your *${sub.service}* subscription expires in ${REMINDER_DAYS} days. Contact us to renew!`,
