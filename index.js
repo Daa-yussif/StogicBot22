@@ -4,15 +4,13 @@ const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
 const cron = require("node-cron");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+const Groq = require("groq-sdk");
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const app = express();
 app.use(express.json());
 
 const ADMIN_ID = parseInt(process.env.ADMIN_ID);
-const FLW_SECRET = process.env.FLUTTERWAVE_SECRET_KEY;
-const FLW_WEBHOOK_SECRET = process.env.FLW_WEBHOOK_SECRET;
 const THANK_DELAY_MS = parseInt(process.env.THANK_DELAY_MS) || 180000;
 const REMINDER_DAYS = parseInt(process.env.SUBSCRIPTION_REMINDER_DAYS) || 3;
 const RENDER_URL = process.env.RENDER_URL;
@@ -20,9 +18,8 @@ const RENDER_URL = process.env.RENDER_URL;
 const LEADS_FILE = "leads.json";
 const SUBSCRIPTIONS_FILE = "subscriptions.json";
 
-// ====== Gemini AI Setup ======
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.0-flash" }); // Fixed model name
+// ====== Groq AI Setup ======
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 const STOGIC_SYSTEM_PROMPT = `You are Stogic AI, a friendly and professional customer support assistant for Stogic Digital Solutions, a tech company based in Accra, Ghana.
 
@@ -42,41 +39,49 @@ Company info:
 - Location: Accra, Ghana
 - Email: info@stogic.com
 - Phone: +233 59 382 7001
+- MoMo Payment: 0593827001 (Yussif Daa Mbazor)
 - Website: https://stogic.com
 
 Important rules:
 - Keep responses under 150 words
-- If someone wants to get a quote or buy, tell them to type the service name (e.g. "CCTV", "Website", "Networking", "Automation") to start the process
+- If someone wants a quote or wants to buy, tell them to type the service name (e.g. "CCTV", "Website", "Networking", "Automation") to start the process
 - Never make up information not listed above
-- Always be helpful and encourage the customer
+- Always be helpful and encouraging
 - Respond in the same language the customer uses`;
 
+// Store chat histories per user
 const chatHistories = new Map();
 
-async function askGemini(chatId, userMessage) {
+async function askGroq(chatId, userMessage) {
   try {
     if (!chatHistories.has(chatId)) chatHistories.set(chatId, []);
     const history = chatHistories.get(chatId);
 
-    const chat = geminiModel.startChat({
-      history: [
-        { role: "user", parts: [{ text: STOGIC_SYSTEM_PROMPT }] },
-        { role: "model", parts: [{ text: "Understood! I'm Stogic AI, ready to help customers of Stogic Digital Solutions. I'll answer questions about our services professionally and guide customers through their options." }] },
-        ...history,
-      ],
-      generationConfig: { maxOutputTokens: 300 },
+    const messages = [
+      { role: "system", content: STOGIC_SYSTEM_PROMPT },
+      ...history,
+      { role: "user", content: userMessage },
+    ];
+
+    const response = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages,
+      max_tokens: 300,
+      temperature: 0.7,
     });
 
-    const result = await chat.sendMessage(userMessage);
-    const response = result.response.text();
+    const reply = response.choices[0]?.message?.content || null;
 
-    history.push({ role: "user", parts: [{ text: userMessage }] });
-    history.push({ role: "model", parts: [{ text: response }] });
-    if (history.length > 20) history.splice(0, 2);
+    if (reply) {
+      // Keep last 10 exchanges to save memory
+      history.push({ role: "user", content: userMessage });
+      history.push({ role: "assistant", content: reply });
+      if (history.length > 20) history.splice(0, 2);
+    }
 
-    return response;
+    return reply;
   } catch (err) {
-    console.error("Gemini error:", err.message);
+    console.error("Groq error:", err.message);
     return null;
   }
 }
@@ -463,11 +468,13 @@ bot.on("text", async (ctx) => {
 
   scheduleThankYou(chatId);
 
+  // Cancel at any point
   if (lower === "/cancel" || lower === "cancel") {
     clearSession(chatId);
     return ctx.reply("❌ Cancelled. Returning to main menu.", MAIN_MENU);
   }
 
+  // Route active session
   const session = getSession(chatId);
   if (session) {
     try {
@@ -484,6 +491,22 @@ bot.on("text", async (ctx) => {
     }
   }
 
+  // Let AI handle informational/question messages first
+  const isQuestion =
+    lower.startsWith("what") || lower.startsWith("how") ||
+    lower.startsWith("tell") || lower.startsWith("explain") ||
+    lower.startsWith("why") || lower.startsWith("who") ||
+    lower.startsWith("is ") || lower.startsWith("can ") ||
+    lower.startsWith("do ") || lower.startsWith("does ") ||
+    lower.startsWith("which") || lower.startsWith("where");
+
+  if (isQuestion) {
+    await ctx.sendChatAction("typing");
+    const aiReply = await askGroq(chatId, text);
+    if (aiReply) return ctx.reply(aiReply, { parse_mode: "Markdown" });
+  }
+
+  // Start service flows
   if (lower.includes("cctv")) {
     setSession(chatId, { flow: "cctv", step: "cameras", data: {} });
     return ctx.reply("📹 *CCTV Installation*\nHow many cameras do you need?", { parse_mode: "Markdown" });
@@ -500,6 +523,8 @@ bot.on("text", async (ctx) => {
     setSession(chatId, { flow: "automation", step: "plan", data: {} });
     return ctx.reply("🤖 *Automation Services*\nChoose a plan:\n*30-day / 60-day / 90-day*", { parse_mode: "Markdown" });
   }
+
+  // Static options
   if (lower.includes("see our work") || lower.includes("portfolio")) {
     return ctx.reply("💼 *Our Portfolio*\nCheck out our work at: https://stogic.com/portfolio\n\nFeel free to ask about any service!", { parse_mode: "Markdown" });
   }
@@ -516,63 +541,15 @@ bot.on("text", async (ctx) => {
     return sendMainMenu(ctx);
   }
 
-  // AI fallback
+  // AI handles everything else
   await ctx.sendChatAction("typing");
-  const aiReply = await askGemini(chatId, text);
+  const aiReply = await askGroq(chatId, text);
   if (aiReply) return ctx.reply(aiReply, { parse_mode: "Markdown" });
 
   ctx.reply("❓ I didn't quite get that. Please select a service from the menu, or type *cancel* to reset.", {
     parse_mode: "Markdown",
     ...MAIN_MENU,
   });
-});
-
-// ===== Flutterwave Webhook (ready for later) =====
-app.post("/flutterwave-webhook", async (req, res) => {
-  try {
-    const hash = req.headers["verif-hash"];
-    if (!hash || hash !== FLW_WEBHOOK_SECRET) return res.sendStatus(401);
-
-    const event = req.body;
-    if (!event || !event.data) return res.sendStatus(400);
-
-    const txId = event.data.id;
-    const paymentRef = event.data.tx_ref;
-
-    const verify = await axios.get(`https://api.flutterwave.com/v3/transactions/${txId}/verify`, {
-      headers: { Authorization: `Bearer ${FLW_SECRET}` },
-    });
-
-    const tx = verify.data.data;
-    if (tx.status !== "successful") return res.sendStatus(200);
-
-    const leads = await readJSON(LEADS_FILE);
-    const lead = leads.find((l) => l.paymentRef === paymentRef);
-    if (!lead || lead.paid) return res.sendStatus(200);
-
-    lead.paid = true;
-    await writeJSON(LEADS_FILE, leads);
-
-    const startDate = Date.now();
-    const expiryDate = startDate + lead.subscriptionDays * 24 * 60 * 60 * 1000;
-
-    const subs = await readJSON(SUBSCRIPTIONS_FILE);
-    subs.push({ chatId: lead.chatId, name: lead.name, service: lead.service, startDate, expiryDate, paid: true, expired: false });
-    await writeJSON(SUBSCRIPTIONS_FILE, subs);
-
-    await bot.telegram.sendMessage(lead.chatId,
-      `✅ Payment confirmed! Your *${lead.service}* subscription is now active.\nExpires: ${new Date(expiryDate).toLocaleDateString()}.`,
-      { parse_mode: "Markdown" }
-    );
-    await bot.telegram.sendMessage(ADMIN_ID,
-      `💰 Payment confirmed!\nName: ${lead.name}\nService: ${lead.service}\nAmount: GHS ${lead.totalPrice}\nExpiry: ${new Date(expiryDate).toLocaleDateString()}`
-    );
-
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("Webhook error:", err);
-    res.sendStatus(500);
-  }
 });
 
 // ===== Subscription Reminder Cron =====
