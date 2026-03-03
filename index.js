@@ -607,20 +607,10 @@ connectDB()
   .then(() => {
     app.listen(PORT, () => console.log(`🚀 Stogic Bot server running on port ${PORT}`));
 
-    const launchTimeout = setTimeout(() => {
-      console.error("❌ Bot launch timed out after 20 seconds. Check BOT_TOKEN or network.");
-      process.exit(1);
-    }, 20000);
-
     bot.launch()
-      .then(() => {
-        clearTimeout(launchTimeout);
-        console.log("🤖 Telegram bot launched");
-      })
+      .then(() => console.log("🤖 Telegram bot launched"))
       .catch((err) => {
-        clearTimeout(launchTimeout);
         console.error("❌ Bot launch failed:", err.message);
-        console.error("Full error:", JSON.stringify(err, null, 2));
         process.exit(1);
       });
   })
